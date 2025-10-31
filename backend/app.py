@@ -135,7 +135,10 @@ def load_models():
         gpu_available = configure_gpu()
 
         # Load default HF model (can be changed via env HF_MODEL_ID or API)
-        default_hf_model = os.environ.get('HF_MODEL_ID', 'sgao2/fake_vs_real_image_classifier')
+        # default_hf_model = os.environ.get('HF_MODEL_ID', 'Organika/sdxl-detector')
+        default_hf_model = os.environ.get('HF_MODEL_ID', 'Smogy/SMOGY-Ai-images-detector')
+        # default_hf_model = os.environ.get('HF_MODEL_ID', 'dima806/deepfake_vs_real_image_detection') # this is the most accurate one yet with some wrong results
+        # default_hf_model = os.environ.get('HF_MODEL_ID', 'Yin2610/autotrain2')
         load_hf_model(default_hf_model)
 
         # Optionally load a visualization backbone for feature maps
@@ -325,23 +328,9 @@ def perform_final_prediction(image, analysis_data):
         raw_preds = [{ 'label': p['label'], 'score': float(p['score']) } for p in preds]
 
         # Simple mapping from labels
-        labels_text = ' '.join(p['label'] for p in raw_preds).lower()
-        fake_terms = ['fake', 'ai', 'artificial', 'generated', 'synthetic', 'cgi', 'diffusion']
-        real_terms = ['real', 'authentic', 'natural', 'photo', 'photograph']
-        is_fake = any(t in labels_text for t in fake_terms)
-        is_real = any(t in labels_text for t in real_terms)
-
         top = raw_preds[0] if raw_preds else { 'label': 'unknown', 'score': 0.5 }
-        if is_fake and not is_real:
-            result = "AI-Generated/Fake"
-            confidence = float(top['score'])
-        elif is_real and not is_fake:
-            result = "Real/Authentic"
-            confidence = float(top['score'])
-        else:
-            result = f"Unknown ({top['label']})"
-            confidence = float(top['score'])
-
+        result = top['label']
+        confidence = float(top['score'])
         analysis_data['raw_predictions'] = raw_preds
         print(f"  → HF top-1: {top['label']} ({top['score']:.4f})")
         return result, confidence

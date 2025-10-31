@@ -265,8 +265,8 @@ const DetectionPage: React.FC = () => {
             {detectionResult && !isProcessing && (
               <Box className="animate-fade-in">
                 <Alert
-                  severity={detectionResult.prediction.includes('Real') ? 'success' : 'error'}
-                  icon={detectionResult.prediction.includes('Real') ? <CheckCircleIcon /> : <ErrorIcon />}
+                  severity={detectionResult.prediction.includes('human') ? 'success' : 'error'}
+                  icon={detectionResult.prediction.includes('human') ? <CheckCircleIcon /> : <ErrorIcon />}
                   sx={{ mb: 3 }}
                 >
                   <Typography variant="h6">
