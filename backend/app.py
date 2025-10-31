@@ -6,15 +6,14 @@ from PIL import Image
 import io
 import base64
 import tensorflow as tf
-from tensorflow.keras.applications import EfficientNetB4
-from tensorflow.keras.models import Model
-from tensorflow.keras.layers import GlobalAveragePooling2D, Dense, Dropout, BatchNormalization
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import urllib.request
 import os
 from transformers import AutoImageProcessor, AutoModelForImageClassification, pipeline
+import torch
+import math
 
 app = Flask(__name__)
 CORS(app)
@@ -84,44 +83,7 @@ def load_hf_model(model_id: str):
         pass
     print(f"✓ HF model ready on {'GPU' if device == 0 else 'CPU'}")
 
-def create_detection_model():
-    """Create fake detection model with proper architecture"""
-    # Use ResNet50 or EfficientNetB4 as commonly used for fake detection
-    base = EfficientNetB4(weights=None, include_top=False, input_shape=(224, 224, 3))
-    
-    # Detection head specifically for binary classification (Real vs Fake)
-    x = base.output
-    x = GlobalAveragePooling2D()(x)
-    x = BatchNormalization()(x)
-    x = Dense(512, activation='relu')(x)
-    x = Dropout(0.5)(x)
-    x = Dense(256, activation='relu')(x)
-    x = Dropout(0.3)(x)
-    x = Dense(128, activation='relu')(x)
-    x = Dropout(0.2)(x)
-    predictions = Dense(1, activation='sigmoid', name='fake_probability')(x)
-    
-    model = Model(inputs=base.input, outputs=predictions)
-    
-    # Load pre-trained weights if available
-    if os.path.exists(MODEL_PATH):
-        print(f"Loading pre-trained weights from {MODEL_PATH}")
-        model.load_weights(MODEL_PATH)
-    else:
-        print("⚠ No pre-trained weights found. Model will use random initialization.")
-        print("⚠ To get better results, train the model on datasets like:")
-        print("   - FaceForensics++")
-        print("   - DFDC (Deepfake Detection Challenge)")
-        print("   - Celeb-DF")
-        print("   - GenImage dataset")
-    
-    model.compile(
-        optimizer='adam',
-        loss='binary_crossentropy',
-        metrics=['accuracy']
-    )
-    
-    return model, base
+# Legacy Keras-based model removed; using only Hugging Face models
 
 def load_models():
     """Load the detection model"""
@@ -141,16 +103,7 @@ def load_models():
         # default_hf_model = os.environ.get('HF_MODEL_ID', 'Yin2610/autotrain2')
         load_hf_model(default_hf_model)
 
-        # Optionally load a visualization backbone for feature maps
-        try:
-            if EfficientNetB4 is not None and Model is not None:
-                with tf.device('/GPU:0' if gpu_available else '/CPU:0'):
-                    base = EfficientNetB4(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-                global base_model
-                base_model = base
-                print("✓ Visualization backbone (EfficientNet-B4) ready for feature maps")
-        except Exception as viz_e:
-            print(f"(Non-fatal) Visualization backbone unavailable: {viz_e}")
+        # Only Hugging Face models are used now; no Keras backbone
 
         print("="*60)
         
@@ -165,6 +118,124 @@ def to_base64_url(fig):
     buf.seek(0)
     plt.close(fig)
     return "data:image/png;base64," + base64.b64encode(buf.read()).decode()
+
+def _resize_heatmap_to_image(hmap: np.ndarray, image_shape: tuple) -> np.ndarray:
+    """Resize a heatmap (H, W) to match the given image shape (H, W, C)."""
+    h, w = image_shape[:2]
+    return cv2.resize(hmap, (w, h), interpolation=cv2.INTER_CUBIC)
+
+def analyze_hf_internals(image_np: np.ndarray):
+    """Analyze Hugging Face model internals: attentions and hidden states (if available).
+    Returns a list of analysis steps.
+    """
+    steps = []
+    if hf_model is None or hf_processor is None:
+        steps.append({
+            'step_number': 1,
+            'step_name': 'Model Internals',
+            'finding': 'Hugging Face model not loaded',
+            'interpretation': 'Load a model via /api/models/select to view internals.',
+            'visualization': None
+        })
+        return steps
+
+    try:
+        pil_img = Image.fromarray(image_np)
+        inputs = hf_processor(images=pil_img, return_tensors='pt')
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        hf_model.to(device)
+        hf_model.eval()
+
+        with torch.no_grad():
+            outputs = hf_model(**inputs, output_hidden_states=True, output_attentions=True, return_dict=True)
+
+        # Attention map (last layer, CLS->patches)
+        if hasattr(outputs, 'attentions') and outputs.attentions is not None and len(outputs.attentions) > 0:
+            try:
+                last_attn = outputs.attentions[-1][0]  # (heads, seq, seq)
+                attn = last_attn.mean(dim=0)  # (seq, seq)
+                cls_to_tokens = attn[0, 1:].detach().float().cpu().numpy()  # (seq-1)
+                n_tokens = cls_to_tokens.shape[0]
+                grid_size = int(math.sqrt(n_tokens))
+                if grid_size * grid_size == n_tokens:
+                    grid = cls_to_tokens.reshape(grid_size, grid_size)
+                    grid = (grid - grid.min()) / (grid.max() - grid.min() + 1e-8)
+                    heat = _resize_heatmap_to_image(grid, image_np.shape)
+
+                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+                    ax1.imshow(pil_img)
+                    ax1.set_title('Original')
+                    ax1.axis('off')
+                    ax2.imshow(pil_img)
+                    ax2.imshow(heat, cmap='jet', alpha=0.45)
+                    ax2.set_title('Last-Layer CLS Attention')
+                    ax2.axis('off')
+                    vis_url = to_base64_url(fig)
+
+                    steps.append({
+                        'step_number': len(steps)+1,
+                        'step_name': 'Attention (Last Layer)',
+                        'finding': 'CLS-to-patches attention from final transformer layer.',
+                        'interpretation': 'Brighter regions indicate higher attention; these areas influenced the classification more.',
+                        'visualization': vis_url
+                    })
+            except Exception as e:
+                print(f"Attention visualization error: {e}")
+
+        # Hidden state token norms (mid layer)
+        if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None and len(outputs.hidden_states) > 2:
+            try:
+                mid_idx = len(outputs.hidden_states) // 2
+                mid = outputs.hidden_states[mid_idx][0]  # (seq, dim)
+                tokens = mid[1:, :].detach().float().cpu().numpy()
+                norms = np.linalg.norm(tokens, axis=1)
+                n_tokens = norms.shape[0]
+                grid_size = int(math.sqrt(n_tokens))
+                if grid_size * grid_size == n_tokens:
+                    grid = norms.reshape(grid_size, grid_size)
+                    grid = (grid - grid.min()) / (grid.max() - grid.min() + 1e-8)
+                    heat = _resize_heatmap_to_image(grid, image_np.shape)
+
+                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+                    ax1.imshow(pil_img)
+                    ax1.set_title('Original')
+                    ax1.axis('off')
+                    ax2.imshow(heat, cmap='viridis')
+                    ax2.set_title('Mid-Layer Token Norms')
+                    ax2.axis('off')
+                    vis_url = to_base64_url(fig)
+
+                    steps.append({
+                        'step_number': len(steps)+1,
+                        'step_name': 'Hidden Features (Mid Layer)',
+                        'finding': 'Token-wise activation strengths (L2 norms) at a middle layer.',
+                        'interpretation': 'Higher values suggest regions with stronger feature activations.',
+                        'visualization': vis_url
+                    })
+            except Exception as e:
+                print(f"Hidden-state visualization error: {e}")
+
+        if not steps:
+            steps.append({
+                'step_number': 1,
+                'step_name': 'Model Internals',
+                'finding': 'This model does not expose attentions/hidden states or is not transformer-based.',
+                'interpretation': 'Try a ViT/DeiT model for richer internal visualizations.',
+                'visualization': None
+            })
+
+    except Exception as e:
+        print(f"HF internals error: {e}")
+        steps.append({
+            'step_number': len(steps)+1 if steps else 1,
+            'step_name': 'Model Internals',
+            'finding': 'Failed to compute model internals.',
+            'interpretation': str(e),
+            'visualization': None
+        })
+
+    return steps
 
 def analyze_face_detection(image):
     """Step 1: Face Detection Analysis"""
@@ -278,43 +349,7 @@ def analyze_compression(image):
         print(f"Compression error: {e}")
         return "Compression analysis unavailable", "", None, 0
 
-def analyze_neural_features(image):
-    """Step 5: Neural Network Feature Analysis"""
-    try:
-        if base_model is None:
-            return "Neural analysis unavailable", "", None
-        
-        # Preprocess
-        img_resized = cv2.resize(image, (224, 224))
-        img_array = img_resized.astype(np.float32) / 255.0
-        img_batch = np.expand_dims(img_array, axis=0)
-        
-        # Get intermediate layer
-        layer_name = 'block3a_expand_activation'
-        if layer_name not in [layer.name for layer in base_model.layers]:
-            layer_name = base_model.layers[len(base_model.layers)//2].name
-        
-        feature_model = Model(inputs=base_model.input, outputs=base_model.get_layer(layer_name).output)
-        features = feature_model.predict(img_batch, verbose=0)
-        
-        # Visualize first 16 feature maps
-        fig, axes = plt.subplots(4, 4, figsize=(10, 10))
-        for i, ax in enumerate(axes.flat):
-            if i < features.shape[-1]:
-                ax.imshow(features[0, :, :, i], cmap='viridis')
-            ax.axis('off')
-        fig.suptitle(f'Neural Features from {layer_name}')
-        
-        vis_url = to_base64_url(fig)
-        
-        finding = f"Analyzed features from layer: {layer_name}"
-        interpretation = "Neural network features reveal high-level patterns learned for distinguishing real vs AI-generated content."
-        
-        return finding, interpretation, vis_url
-        
-    except Exception as e:
-        print(f"Neural features error: {e}")
-        return "Neural feature analysis unavailable", "", None
+"""Neural feature analysis via Keras removed; using Hugging Face internals instead."""
 
 def perform_final_prediction(image, analysis_data):
     """Step 6: Final Prediction using Hugging Face model pipeline"""
@@ -355,71 +390,11 @@ def detect():
         print(f"ANALYZING IMAGE: {file.filename}")
         print(f"{'='*60}")
         
-        # Perform all analysis steps and collect metrics
-        analysis_steps = []
+        # Model internals (HF) + final prediction
         analysis_data = {}
-        
-        # Step 1: Face Detection
-        print("→ Step 1: Face Detection...")
-        finding, interp, vis, face_count = analyze_face_detection(image_np)
-        analysis_data['face_count'] = face_count
-        analysis_steps.append({
-            'step_number': 1,
-            'step_name': 'Face Detection',
-            'finding': finding,
-            'interpretation': interp,
-            'visualization': vis
-        })
-        
-        # Step 2: Texture Analysis
-        print("→ Step 2: Texture Analysis...")
-        finding, interp, vis, texture_var = analyze_texture(image_np)
-        analysis_data['texture_variance'] = texture_var
-        analysis_steps.append({
-            'step_number': 2,
-            'step_name': 'Texture Analysis',
-            'finding': finding,
-            'interpretation': interp,
-            'visualization': vis
-        })
-        
-        # Step 3: Edge Consistency
-        print("→ Step 3: Edge Analysis...")
-        finding, interp, vis, edge_dens = analyze_edges(image_np)
-        analysis_data['edge_density'] = edge_dens
-        analysis_steps.append({
-            'step_number': 3,
-            'step_name': 'Edge Consistency',
-            'finding': finding,
-            'interpretation': interp,
-            'visualization': vis
-        })
-        
-        # Step 4: Compression Artifacts
-        print("→ Step 4: Compression Analysis...")
-        finding, interp, vis, color_var = analyze_compression(image_np)
-        analysis_data['color_variance'] = color_var
-        analysis_steps.append({
-            'step_number': 4,
-            'step_name': 'Compression Artifacts',
-            'finding': finding,
-            'interpretation': interp,
-            'visualization': vis
-        })
-        
-        # Step 5: Neural Features
-        print("→ Step 5: Neural Features...")
-        finding, interp, vis = analyze_neural_features(image_np)
-        analysis_steps.append({
-            'step_number': 5,
-            'step_name': 'Neural Network Features',
-            'finding': finding,
-            'interpretation': interp,
-            'visualization': vis
-        })
-        
-        # Step 6: FINAL PREDICTION - Based on heuristics
-        print("→ Step 6: Final Prediction...")
+        print("→ Model Internals (HF)...")
+        analysis_steps = analyze_hf_internals(image_np)
+        print("→ Final Prediction (HF pipeline)...")
         result, confidence = perform_final_prediction(image_np, analysis_data)
         
         print(f"\n{'='*60}")

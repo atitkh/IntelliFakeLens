@@ -6,9 +6,7 @@ import {
   Grid,
   Alert,
   Button,
-  Stepper,
-  Step,
-  StepLabel,
+  LinearProgress,
   Accordion,
   AccordionSummary,
   AccordionDetails,
@@ -54,7 +52,6 @@ const DetectionPage: React.FC = () => {
   const [imagePreview, setImagePreview] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [detectionResult, setDetectionResult] = useState<DetectionResult | null>(null);
-  const [activeStep, setActiveStep] = useState(-1);
   const [expandedStep, setExpandedStep] = useState<string | false>(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [dialogImage, setDialogImage] = useState<string | null>(null);
@@ -83,26 +80,12 @@ const DetectionPage: React.FC = () => {
     if (!uploadedImage) return;
 
     setIsProcessing(true);
-    setActiveStep(0);
     setError(null);
     setDetectionResult(null);
 
     try {
       const formData = new FormData();
       formData.append('image', uploadedImage);
-
-      // Simulate processing steps for demo
-      const steps = [
-        'Preprocessing image',
-        'Feature extraction',
-        'Model inference',
-        'Analysis complete'
-      ];
-
-      for (let i = 0; i < steps.length; i++) {
-        setActiveStep(i);
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
 
       const response = await axios.post('http://localhost:5000/api/detect', formData, {
         headers: {
@@ -111,7 +94,6 @@ const DetectionPage: React.FC = () => {
       });
 
       setDetectionResult(response.data);
-      setActiveStep(steps.length);
     } catch (err: any) {
       console.error('Detection failed:', err);
       let errorMessage = 'Detection failed. ';
@@ -129,7 +111,6 @@ const DetectionPage: React.FC = () => {
       }
       
       setError(errorMessage);
-      setActiveStep(-1);
     } finally {
       setIsProcessing(false);
     }
@@ -156,13 +137,6 @@ const DetectionPage: React.FC = () => {
     setDialogImage(null);
     setDialogTitle('');
   };
-
-  const steps = [
-    'Preprocessing image',
-    'Feature extraction', 
-    'Model inference',
-    'Analysis complete'
-  ];
 
   return (
     <Box>
@@ -232,14 +206,11 @@ const DetectionPage: React.FC = () => {
             </Typography>
 
             {isProcessing && (
-              <Box>
-                <Stepper activeStep={activeStep} orientation="vertical">
-                  {steps.map((label) => (
-                    <Step key={label}>
-                      <StepLabel>{label}</StepLabel>
-                    </Step>
-                  ))}
-                </Stepper>
+              <Box sx={{ mb: 3 }}>
+                <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                  Analyzing with Hugging Face model…
+                </Typography>
+                <LinearProgress />
               </Box>
             )}
 
@@ -337,7 +308,7 @@ const DetectionPage: React.FC = () => {
                 </Typography>
                 <Box className="detection-steps">
                   {detectionResult.analysis_steps.map((step, index) => {
-                    const isNeuralLayer = step.step_name.includes('Neural');
+                    const isNeuralLayer = /Neural|Attention|Hidden/i.test(step.step_name);
                     return (
                     <Accordion 
                       key={index} 
