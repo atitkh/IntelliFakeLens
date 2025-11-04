@@ -514,8 +514,10 @@ def explain_with_vit(image_np: np.ndarray):
 
             L = len(attns)
             first_idx = 0
-            mid_idx = L // 2
             last_idx = L - 1
+            # Choose two middle layers (left and right) so for 12 layers we show 5 and 6 (0-based indices 4 and 5 or 5 and 6 depending on even L).
+            mid_left_idx = max(0, (L // 2) - 2)
+            mid_right_idx = min(L - 1, (L // 2))
 
             render_attn_step(
                 attns[first_idx],
@@ -524,14 +526,44 @@ def explain_with_vit(image_np: np.ndarray):
                 'Brighter areas = early cues the model picks up first. These are low-level features.'
             )
 
-            if mid_idx not in (first_idx, last_idx):
-                render_attn_step(
-                    attns[mid_idx],
-                    'Attention (Middle Layer)',
-                    'Middle-layer attention: the model starts grouping parts and textures.',
-                    'Brighter areas = mid-level structures (parts of objects, textures) that guide later layers.',
-                    cmap='inferno'
-                )
+            # Middle layers overlay: average of two middle layers (e.g., 5 and 6 for 12-layer ViT)
+            try:
+                if mid_left_idx not in (first_idx, last_idx) or mid_right_idx not in (first_idx, last_idx):
+                    m_left = attns[mid_left_idx][0].mean(dim=0)  # (S,S)
+                    m_right = attns[mid_right_idx][0].mean(dim=0)
+                    vec_left = m_left[0, 1:].detach().float().cpu().numpy()
+                    vec_right = m_right[0, 1:].detach().float().cpu().numpy()
+                    if vec_left.shape[0] == vec_right.shape[0]:
+                        n_tokens = vec_left.shape[0]
+                        g2 = int(round(math.sqrt(max(1, n_tokens))))
+                        if g2 * g2 == n_tokens:
+                            grid_left = vec_left.reshape(g2, g2)
+                            grid_right = vec_right.reshape(g2, g2)
+                            grid_map = (grid_left + grid_right) / 2.0
+                            grid_map = (grid_map - grid_map.min()) / (grid_map.max() - grid_map.min() + 1e-8)
+                            heat = _resize_heatmap_to_image(grid_map, image_np.shape)
+                            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+                            ax1.imshow(pil_img); ax1.set_title('Original'); ax1.axis('off')
+                            ax2.imshow(pil_img); ax2.imshow(heat, cmap='jet', alpha=0.45)
+                            mid_title = f"Attention (Middle Layers {mid_left_idx+1}+{mid_right_idx+1})"
+                            ax2.set_title(mid_title); ax2.axis('off')
+                            steps.append({
+                                'step_number': len(steps)+1,
+                                'step_name': mid_title,
+                                'finding': 'Middle-layer attention (two adjacent layers averaged) where the model starts grouping parts and textures.',
+                                'interpretation': 'Brighter areas = mid-level structures that guide later layers. Averaging two middle layers gives a steadier view than a single layer.',
+                                'visualization': to_base64_url(fig)
+                            })
+                        else:
+                            steps.append({
+                                'step_number': len(steps)+1,
+                                'step_name': 'Attention (Middle Layers)',
+                                'finding': 'Could not turn middle-layer attention into a patch grid for this model.',
+                                'interpretation': f'The internal token count ({n_tokens}) does not form a square grid; ViT/DeiT with 16×16 patches works best.',
+                                'visualization': None
+                            })
+            except Exception as e:
+                print(f"Explainer middle overlay error: {e}")
 
             if last_idx != first_idx:
                 render_attn_step(

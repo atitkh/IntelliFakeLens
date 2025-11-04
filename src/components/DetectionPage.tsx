@@ -136,7 +136,7 @@ const DetectionPage: React.FC = () => {
       const vitSteps: AnalysisStep[] = response.data?.analysis_steps || [];
       setExplainSteps(vitSteps);
       // Kick off sensitivity asynchronously; don't block UI
-      void handleSensitivity();
+      // void handleSensitivity();
     } catch (err) {
       console.error('Explain failed:', err);
       setExplainSteps(null);
