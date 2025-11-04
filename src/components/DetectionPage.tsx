@@ -488,16 +488,16 @@ const DetectionPage: React.FC = () => {
               </Box>
             )}
 
-            {!uploadedImage && !isProcessing && !error && (
+            {!isProcessing && !error && (
               <Box sx={{ textAlign: 'center', color: 'text.secondary', mt: 4 }}>
                 <VisibilityIcon sx={{ fontSize: 64, opacity: 0.3 }} />
                 <Typography variant="body1" sx={{ mt: 2 }}>
-                  Upload an image to see analysis results
+                  Upload an image and click "Analyze Image" to see analysis results
                 </Typography>
               </Box>
             )}
 
-            {uploadedImage && !isProcessing && !detectionResult && !error && (
+            {/* {uploadedImage && !isProcessing && !detectionResult && !error && (
               <Box sx={{ textAlign: 'center', color: 'text.secondary', mt: 4 }}>
                 <Button
                   variant="contained"
@@ -510,7 +510,7 @@ const DetectionPage: React.FC = () => {
                   Click to analyze the uploaded image for deepfake detection
                 </Typography>
               </Box>
-            )}
+            )} */}
           </Paper>
         </Grid>
       </Grid>
