@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useEffect } from 'react';
 import {
   Box,
   Typography,
@@ -53,10 +53,14 @@ const DetectionPage: React.FC = () => {
   const [isProcessing, setIsProcessing] = useState(false);
   const [detectionResult, setDetectionResult] = useState<DetectionResult | null>(null);
   const [expandedStep, setExpandedStep] = useState<string | false>(false);
+  const [explainSteps, setExplainSteps] = useState<AnalysisStep[] | null>(null);
+  const [isExplaining, setIsExplaining] = useState(false);
+  const [isSensitivityLoading, setIsSensitivityLoading] = useState(false);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [dialogImage, setDialogImage] = useState<string | null>(null);
   const [dialogTitle, setDialogTitle] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
+  
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
     const file = acceptedFiles[0];
@@ -64,6 +68,7 @@ const DetectionPage: React.FC = () => {
       setUploadedImage(file);
       setImagePreview(URL.createObjectURL(file));
       setDetectionResult(null);
+      setExplainSteps(null);
       setError(null); // Clear any previous errors
     }
   }, []);
@@ -82,6 +87,7 @@ const DetectionPage: React.FC = () => {
     setIsProcessing(true);
     setError(null);
     setDetectionResult(null);
+    setExplainSteps(null);
 
     try {
       const formData = new FormData();
@@ -115,6 +121,62 @@ const DetectionPage: React.FC = () => {
       setIsProcessing(false);
     }
   };
+
+  const handleExplain = async () => {
+    if (!uploadedImage) return;
+    setIsExplaining(true);
+    try {
+      const formData = new FormData();
+      formData.append('image', uploadedImage);
+      const response = await axios.post('http://localhost:5000/api/explain', formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
+      });
+      const vitSteps: AnalysisStep[] = response.data?.analysis_steps || [];
+      setExplainSteps(vitSteps);
+      // Kick off sensitivity asynchronously; don't block UI
+      void handleSensitivity();
+    } catch (err) {
+      console.error('Explain failed:', err);
+      setExplainSteps(null);
+    } finally {
+      setIsExplaining(false);
+    }
+  };
+
+  const handleSensitivity = async () => {
+    if (!uploadedImage) return;
+    setIsSensitivityLoading(true);
+    try {
+      const formData = new FormData();
+      formData.append('image', uploadedImage);
+      const response = await axios.post('http://localhost:5000/api/explain/sensitivity', formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      const step = response.data?.step as AnalysisStep | undefined;
+      if (step) {
+        // Append to current steps with proper numbering
+        setExplainSteps(prev => {
+          const base = prev ?? [];
+          const numbered = { ...step, step_number: base.length + 1 };
+          return [...base, numbered];
+        });
+      }
+    } catch (err) {
+      console.error('Sensitivity failed:', err);
+    } finally {
+      setIsSensitivityLoading(false);
+    }
+  };
+
+  // Auto-run explanation after detection result arrives
+  useEffect(() => {
+    if (detectionResult && uploadedImage) {
+      handleExplain();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [detectionResult]);
 
   const getConfidenceColor = (confidence: number) => {
     if (confidence >= 0.8) return '#4caf50';
@@ -208,7 +270,7 @@ const DetectionPage: React.FC = () => {
             {isProcessing && (
               <Box sx={{ mb: 3 }}>
                 <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
-                  Analyzing with Hugging Face model…
+                  Analyzing…
                 </Typography>
                 <LinearProgress />
               </Box>
@@ -249,7 +311,7 @@ const DetectionPage: React.FC = () => {
                 </Alert>
 
                 <Box sx={{ mb: 3 }}>
-                  <Typography variant="body2" color="text.secondary" gutterBottom>
+                  {/* <Typography variant="body2" color="text.secondary" gutterBottom>
                     Overall Confidence
                   </Typography>
                   <Box className="confidence-meter">
@@ -260,7 +322,7 @@ const DetectionPage: React.FC = () => {
                         backgroundColor: getConfidenceColor(detectionResult.confidence)
                       }}
                     />
-                  </Box>
+                  </Box> */}
                   <Typography variant="caption" color="text.secondary">
                     Model: {detectionResult.model_used}
                   </Typography>
@@ -269,7 +331,7 @@ const DetectionPage: React.FC = () => {
                 {detectionResult.raw_predictions && detectionResult.raw_predictions.length > 0 && (
                   <Paper sx={{ p: 2, mb: 3, backgroundColor: '#f5f5f5' }}>
                     <Typography variant="subtitle2" gutterBottom sx={{ fontWeight: 'bold' }}>
-                      Raw Model Predictions:
+                      Model Predictions:
                     </Typography>
                     {detectionResult.raw_predictions.slice(0, 5).map((pred, idx) => (
                       <Box key={idx} sx={{ mb: 1 }}>
@@ -303,11 +365,32 @@ const DetectionPage: React.FC = () => {
                   </Paper>
                 )}
 
-                {/* <Typography variant="h6" gutterBottom>
+                {(isExplaining || isSensitivityLoading) && (
+                  <Box sx={{ mb: 2 }}>
+                    {isExplaining && (
+                      <>
+                        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                          Generating steps…
+                        </Typography>
+                        <LinearProgress />
+                      </>
+                    )}
+                    {!isExplaining && isSensitivityLoading && (
+                      <>
+                        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+                          Computing detector patch sensitivity…
+                        </Typography>
+                        <LinearProgress color="secondary" />
+                      </>
+                    )}
+                  </Box>
+                )}
+
+                <Typography variant="h6" gutterBottom>
                   Analysis Steps
                 </Typography>
                 <Box className="detection-steps">
-                  {detectionResult.analysis_steps.map((step, index) => {
+                  {(explainSteps ?? detectionResult.analysis_steps).map((step, index) => {
                     const isNeuralLayer = /Neural|Attention|Hidden/i.test(step.step_name);
                     return (
                     <Accordion 
@@ -394,14 +477,6 @@ const DetectionPage: React.FC = () => {
                                   Click to enlarge
                                 </Typography>
                               </Paper>
-                              
-                              {step.interpretation && (
-                                <Alert severity={isNeuralLayer ? "info" : "info"} sx={{ mt: 2 }}>
-                                  <Typography variant="body2">
-                                    <strong>Interpretation:</strong> {step.interpretation}
-                                  </Typography>
-                                </Alert>
-                              )}
                             </Box>
                           )}
                         </Box>
@@ -409,7 +484,7 @@ const DetectionPage: React.FC = () => {
                     </Accordion>
                     );
                   })}
-                </Box> */}
+                </Box>
               </Box>
             )}
 

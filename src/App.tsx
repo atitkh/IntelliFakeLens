@@ -1,7 +1,6 @@
 import React from 'react';
 import { Routes, Route } from 'react-router-dom';
 import { Container, AppBar, Toolbar, Typography, Box } from '@mui/material';
-import SecurityIcon from '@mui/icons-material/Security';
 import DetectionPage from './components/DetectionPage';
 import Navigation from './components/Navigation';
 
@@ -10,7 +9,6 @@ const App: React.FC = () => {
     <Box sx={{ flexGrow: 1, minHeight: '100vh', backgroundColor: '#f5f5f5' }}>
       <AppBar position="static" elevation={0} sx={{ backgroundColor: '#1976d2' }}>
         <Toolbar>
-          <SecurityIcon sx={{ mr: 2 }} />
           <Typography variant="h6" component="div" sx={{ flexGrow: 1, fontWeight: 600 }}>
             IntelliFakeLens
           </Typography>

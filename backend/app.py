@@ -28,6 +28,11 @@ hf_processor = None
 hf_model = None
 hf_pipe = None
 
+# ViT explainer state (for visualization independent of detector)
+explainer_model_id = None
+explainer_processor = None
+explainer_model = None
+
 # Model URLs for pre-trained fake detection
 MODEL_WEIGHTS_URL = "https://github.com/WisconsinAIVision/UniversalFakeDetect/tree/main/pretrained_weights/fc_weights.pth"
 MODEL_DIR = "models"
@@ -83,6 +88,38 @@ def load_hf_model(model_id: str):
         pass
     print(f"✓ HF model ready on {'GPU' if device == 0 else 'CPU'}")
 
+def load_explainer_model(model_id: str = 'google/vit-base-patch16-224'):
+    """Load a ViT/DeiT model for explanations (attentions, rollout, etc.)."""
+    global explainer_model_id, explainer_processor, explainer_model
+    print("-"*60)
+    print(f"Loading ViT explainer: {model_id}")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    explainer_processor = AutoImageProcessor.from_pretrained(model_id)
+    explainer_model = AutoModelForImageClassification.from_pretrained(model_id).to(device)
+    # Ensure attention outputs are capturable by switching to eager implementation
+    try:
+        if hasattr(explainer_model, 'set_attn_implementation'):
+            explainer_model.set_attn_implementation('eager')
+        # Also try on common encoder attributes
+        for sub_name in ('vit', 'deit'):
+            sub = getattr(explainer_model, sub_name, None)
+            if sub is not None and hasattr(sub, 'set_attn_implementation'):
+                sub.set_attn_implementation('eager')
+        # Reflect in config when possible
+        if hasattr(explainer_model, 'config') and hasattr(explainer_model.config, 'attn_implementation'):
+            explainer_model.config.attn_implementation = 'eager'
+    except Exception as e:
+        print(f"Explainer attn impl set error: {e}")
+    # Force-enable internals for reliability
+    try:
+        explainer_model.config.output_attentions = True
+        explainer_model.config.output_hidden_states = True
+    except Exception:
+        pass
+    explainer_model.eval()
+    explainer_model_id = model_id
+    print(f"✓ ViT explainer ready on {device.upper()}")
+
 # Legacy Keras-based model removed; using only Hugging Face models
 
 def load_models():
@@ -104,6 +141,10 @@ def load_models():
         # default_hf_model = os.environ.get('HF_MODEL_ID', 'Yin2610/autotrain2')
         load_hf_model(default_hf_model)
 
+        # Load explainer ViT model (independent of detector)
+        default_explainer = os.environ.get('HF_EXPLAINER_ID', 'google/vit-base-patch16-224')
+        load_explainer_model(default_explainer)
+
         # Only Hugging Face models are used now; no Keras backbone
 
         print("="*60)
@@ -124,6 +165,119 @@ def _resize_heatmap_to_image(hmap: np.ndarray, image_shape: tuple) -> np.ndarray
     """Resize a heatmap (H, W) to match the given image shape (H, W, C)."""
     h, w = image_shape[:2]
     return cv2.resize(hmap, (w, h), interpolation=cv2.INTER_CUBIC)
+
+def attention_rollout(attentions):
+    """Attention rollout per Abnar & Zuidema: multiply residual-attention across layers.
+    attentions: list of tensors (B, H, S, S); returns (S, S) rollout matrix.
+    """
+    try:
+        with torch.no_grad():
+            maps = [att[0].mean(dim=0) for att in attentions]  # (S, S) averaged over heads
+            eye = torch.eye(maps[0].size(-1), device=maps[0].device)
+            # add identity and row-normalize
+            maps = [(m + eye) / (m + eye).sum(dim=-1, keepdim=True) for m in maps]
+            rollout = maps[0]
+            for m in maps[1:]:
+                rollout = m @ rollout
+            return rollout
+    except Exception as e:
+        print(f"Attention rollout error: {e}")
+        return None
+
+def compute_patch_sensitivity(image_np: np.ndarray, grid: int = 10):
+    """Compute detector-based occlusion sensitivity.
+    For each patch, blur that region, re-score the current detector's top class,
+    and measure probability drop. Returns (vis_url, finding_text) or (None, reason).
+    """
+    try:
+        if hf_model is None or hf_processor is None:
+            return None, 'Detector not loaded'
+
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        hf_model.to(device)
+        hf_model.eval()
+
+        pil_img = Image.fromarray(image_np)
+        inputs = hf_processor(images=pil_img, return_tensors='pt')
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        # Baseline logits and margin (top vs next-best) to avoid softmax saturation
+        with torch.no_grad():
+            logits = hf_model(**inputs, return_dict=True).logits[0]
+            top_id = int(torch.argmax(logits).item())
+            top_logit = float(logits[top_id].item())
+            other_mask = torch.ones_like(logits, dtype=torch.bool)
+            other_mask[top_id] = False
+            other_max = float(torch.max(logits[other_mask]).item())
+            baseline_margin = top_logit - other_max
+
+        # Prepare strong occluders: heavy blur and solid mean-color fill
+        blurred = cv2.GaussianBlur(image_np, (49, 49), sigmaX=0)
+        mean_color = image_np.reshape(-1, image_np.shape[-1]).mean(axis=0)
+        mean_color = np.clip(mean_color, 0, 255).astype(np.uint8)
+        H, W = image_np.shape[:2]
+        sens = np.zeros((grid, grid), dtype=np.float32)
+
+        def margin_for(img_np):
+            pimg = Image.fromarray(img_np)
+            tin = hf_processor(images=pimg, return_tensors='pt')
+            tin = {k: v.to(device) for k, v in tin.items()}
+            with torch.no_grad():
+                l = hf_model(**tin, return_dict=True).logits[0]
+                top_l = float(l[top_id].item())
+                other_mask = torch.ones_like(l, dtype=torch.bool)
+                other_mask[top_id] = False
+                other_max = float(torch.max(l[other_mask]).item())
+                return top_l - other_max
+
+        for r in range(grid):
+            y0 = int(r * H / grid)
+            y1 = int((r + 1) * H / grid)
+            for c in range(grid):
+                x0 = int(c * W / grid)
+                x1 = int((c + 1) * W / grid)
+                # Occlusion 1: heavy blur patch
+                pert_blur = image_np.copy()
+                pert_blur[y0:y1, x0:x1] = blurred[y0:y1, x0:x1]
+                margin_blur = margin_for(pert_blur)
+
+                # Occlusion 2: solid fill (mean color)
+                pert_solid = image_np.copy()
+                pert_solid[y0:y1, x0:x1] = mean_color
+                margin_solid = margin_for(pert_solid)
+
+                # Take the max drop across occluders (stronger effect)
+                drop_blur = max(0.0, baseline_margin - margin_blur)
+                drop_solid = max(0.0, baseline_margin - margin_solid)
+                sens[r, c] = max(drop_blur, drop_solid)
+
+        # Normalize and resize to image
+        if sens.max() > sens.min():
+            sens = (sens - sens.min()) / (sens.max() - sens.min() + 1e-8)
+        heat = _resize_heatmap_to_image(sens, image_np.shape)
+
+        # Render overlay figure
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        ax1.imshow(pil_img); ax1.set_title('Original'); ax1.axis('off')
+        ax2.imshow(pil_img); ax2.imshow(heat, cmap='magma', alpha=0.5)
+        ax2.set_title('Patch Sensitivity'); ax2.axis('off')
+        vis_url = to_base64_url(fig)
+
+        # Build finding text with class label when available
+        label = None
+        try:
+            if hasattr(hf_model, 'config') and hasattr(hf_model.config, 'id2label'):
+                label = hf_model.config.id2label.get(top_id)
+        except Exception:
+            pass
+        if label:
+            finding = f"Regions most critical for the detector's '{label}' score (brighter = bigger drop when occluded)."
+        else:
+            finding = "Regions most critical for the detector's top prediction (brighter = bigger drop when occluded)."
+
+        return vis_url, finding
+    except Exception as e:
+        print(f"Patch sensitivity error: {e}")
+        return None, str(e)
 
 def analyze_hf_internals(image_np: np.ndarray):
     """Analyze Hugging Face model internals: attentions and hidden states (if available).
@@ -232,6 +386,320 @@ def analyze_hf_internals(image_np: np.ndarray):
             'step_number': len(steps)+1 if steps else 1,
             'step_name': 'Model Internals',
             'finding': 'Failed to compute model internals.',
+            'interpretation': str(e),
+            'visualization': None
+        })
+
+    return steps
+
+def explain_with_vit(image_np: np.ndarray):
+    """Always use the explainer ViT model to create step-by-step visuals."""
+    steps = []
+    if explainer_model is None or explainer_processor is None:
+        steps.append({
+            'step_number': 1,
+            'step_name': 'Explainer Model',
+            'finding': 'ViT explainer not loaded',
+            'interpretation': 'Load a ViT via /api/explainer/select to enable explanations.',
+            'visualization': None
+        })
+        return steps
+
+    try:
+        pil_img = Image.fromarray(image_np)
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        inputs = explainer_processor(images=pil_img, return_tensors='pt')
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = explainer_model(**inputs, output_hidden_states=True, output_attentions=True, return_dict=True)
+
+        # Fallback: if attentions not present from classifier head, query base encoder (e.g., .vit)
+        attns = getattr(outputs, 'attentions', None)
+        hiddens = getattr(outputs, 'hidden_states', None)
+        encoder_outputs = None
+        if (attns is None or len(attns) == 0 or attns[0] is None) or (hiddens is None or len(hiddens) == 0 or hiddens[0] is None):
+            try:
+                if hasattr(explainer_model, 'vit'):
+                    encoder_outputs = explainer_model.vit(
+                        pixel_values=inputs['pixel_values'],
+                        output_attentions=True,
+                        output_hidden_states=True,
+                        return_dict=True
+                    )
+                    if (attns is None or len(attns) == 0 or attns[0] is None) and hasattr(encoder_outputs, 'attentions'):
+                        attns = encoder_outputs.attentions
+                    if (hiddens is None or len(hiddens) == 0 or hiddens[0] is None) and hasattr(encoder_outputs, 'hidden_states'):
+                        hiddens = encoder_outputs.hidden_states
+                elif hasattr(explainer_model, 'deit'):
+                    encoder_outputs = explainer_model.deit(
+                        pixel_values=inputs['pixel_values'],
+                        output_attentions=True,
+                        output_hidden_states=True,
+                        return_dict=True
+                    )
+                    if (attns is None or len(attns) == 0 or attns[0] is None) and hasattr(encoder_outputs, 'attentions'):
+                        attns = encoder_outputs.attentions
+                    if (hiddens is None or len(hiddens) == 0 or hiddens[0] is None) and hasattr(encoder_outputs, 'hidden_states'):
+                        hiddens = encoder_outputs.hidden_states
+            except Exception as e:
+                print(f"Explainer encoder fallback error: {e}")
+
+        # Infer patch grid from attentions (seq includes CLS)
+        H, W = image_np.shape[:2]
+        try:
+            if attns is not None and len(attns) > 0 and attns[0] is not None:
+                seq = attns[0].size(-1)
+                grid = int(math.sqrt(max(1, seq - 1)))
+            elif hiddens is not None and len(hiddens) > 0 and hiddens[-1] is not None:
+                seq = hiddens[-1].size(1)
+                grid = int(math.sqrt(max(1, seq - 1)))
+            else:
+                grid = 14
+        except Exception:
+            grid = 14  # default safe grid
+
+        # Step 1: Patchify grid overlay
+        fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+        ax.imshow(pil_img)
+        for r in range(1, grid):
+            y = r * (H / grid)
+            ax.axhline(y, color='white', lw=0.7, alpha=0.6)
+        for c in range(1, grid):
+            x = c * (W / grid)
+            ax.axvline(x, color='white', lw=0.7, alpha=0.6)
+        ax.set_title(f'Patchify (grid {grid}×{grid})')
+        ax.axis('off')
+        steps.append({
+            'step_number': len(steps)+1,
+            'step_name': 'Patchify',
+            'finding': f'The image is cut into a {grid}×{grid} grid of small tiles ("patches"). A special CLS token is added to summarize the whole image.',
+            'interpretation': 'Think of patches as puzzle pieces the model can read. The CLS token acts like a “summary note” that collects what the model learns from all patches to make the final decision.',
+            'visualization': to_base64_url(fig)
+        })
+
+        # Step 2–4: Attention at first, middle, and last layers (heads averaged)
+        try:
+            if attns is None or len(attns) == 0 or attns[0] is None:
+                raise ValueError('attentions not available')
+
+            def render_attn_step(att, title, find_txt, interp_txt, cmap='jet'):
+                m = att[0].mean(dim=0)  # (S, S)
+                vec = m[0, 1:].detach().float().cpu().numpy()
+                n_tokens = vec.shape[0]
+                g2 = int(round(math.sqrt(max(1, n_tokens))))
+                if g2 * g2 != n_tokens:
+                    steps.append({
+                        'step_number': len(steps)+1,
+                        'step_name': title,
+                        'finding': 'Could not turn attention into a patch grid for this model.',
+                        'interpretation': f'The internal token count ({n_tokens}) does not form a square grid, so a heatmap can’t be drawn. Using a standard ViT/DeiT with 16×16 patches works best.',
+                        'visualization': None
+                    })
+                    return
+                grid_map = vec.reshape(g2, g2)
+                grid_map = (grid_map - grid_map.min()) / (grid_map.max() - grid_map.min() + 1e-8)
+                heat = _resize_heatmap_to_image(grid_map, image_np.shape)
+                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+                ax1.imshow(pil_img); ax1.set_title('Original'); ax1.axis('off')
+                ax2.imshow(pil_img); ax2.imshow(heat, cmap=cmap, alpha=0.45)
+                ax2.set_title(title); ax2.axis('off')
+                steps.append({
+                    'step_number': len(steps)+1,
+                    'step_name': title,
+                    'finding': find_txt,
+                    'interpretation': interp_txt,
+                    'visualization': to_base64_url(fig)
+                })
+
+            L = len(attns)
+            first_idx = 0
+            mid_idx = L // 2
+            last_idx = L - 1
+
+            render_attn_step(
+                attns[first_idx],
+                'Attention (Layer 1)',
+                'Early attention: the model focuses on simple patterns like edges and colors.',
+                'Brighter areas = early cues the model picks up first. These are low-level features.'
+            )
+
+            if mid_idx not in (first_idx, last_idx):
+                render_attn_step(
+                    attns[mid_idx],
+                    'Attention (Middle Layer)',
+                    'Middle-layer attention: the model starts grouping parts and textures.',
+                    'Brighter areas = mid-level structures (parts of objects, textures) that guide later layers.',
+                    cmap='inferno'
+                )
+
+            if last_idx != first_idx:
+                render_attn_step(
+                    attns[last_idx],
+                    'Attention (Last Layer)',
+                    'Decision-time attention: where the model “looked” right before predicting.',
+                    'Brighter areas = final focus. Helpful clue about which patches influenced the decision.',
+                    cmap='jet'
+                )
+        except Exception as e:
+            print(f"Explainer layered attention error: {e}")
+            # Proxy using last hidden state cosine similarity with CLS if available
+            try:
+                if hiddens is not None and len(hiddens) > 0 and hiddens[-1] is not None:
+                    last_hidden = hiddens[-1][0]  # (S, D)
+                    cls = last_hidden[0]
+                    tokens = last_hidden[1:]
+                    cls_norm = (cls.norm(p=2) + 1e-8).item()
+                    tok_norms = tokens.norm(p=2, dim=1) + 1e-8
+                    sims = (tokens @ cls) / (tok_norms * cls_norm)
+                    sims = sims.detach().float().cpu().numpy()
+                    n_tokens = sims.shape[0]
+                    g2 = int(round(math.sqrt(max(1, n_tokens))))
+                    if g2 * g2 == n_tokens:
+                        grid_map = sims.reshape(g2, g2)
+                        grid_map = (grid_map - grid_map.min()) / (grid_map.max() - grid_map.min() + 1e-8)
+                        heat = _resize_heatmap_to_image(grid_map, image_np.shape)
+                        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+                        ax1.imshow(pil_img); ax1.set_title('Original'); ax1.axis('off')
+                        ax2.imshow(pil_img)
+                        ax2.imshow(heat, cmap='plasma', alpha=0.45)
+                        ax2.set_title('Attention (Proxy)')
+                        ax2.axis('off')
+                        steps.append({
+                            'step_number': len(steps)+1,
+                            'step_name': 'Attention (Proxy)',
+                            'finding': 'Backup view: how similar each patch is to the final summary token (CLS).',
+                            'interpretation': 'Brighter areas = patches most aligned with the final summary. Used when native attention maps aren’t available.',
+                            'visualization': to_base64_url(fig)
+                        })
+            except Exception as e2:
+                print(f"Explainer similarity proxy error: {e2}")
+
+        # Step 5: Attention by Layer (collage of all layers)
+        try:
+            if attns is None or len(attns) == 0 or attns[0] is None:
+                raise ValueError('attentions not available for per-layer collage')
+            seq0 = attns[0].size(-1)
+            g2 = int(round(math.sqrt(max(1, seq0 - 1))))
+            if g2 * g2 != (seq0 - 1):
+                steps.append({
+                    'step_number': len(steps)+1,
+                    'step_name': 'Attention by Layer',
+                    'finding': 'Could not map tokens to a square patch grid for per-layer visualization.',
+                    'interpretation': 'This model’s token layout does not correspond to a square patch grid; try a standard ViT with 16×16 patches.',
+                    'visualization': None
+                })
+            else:
+                L = len(attns)
+                cols = min(6, int(math.ceil(math.sqrt(L))))
+                rows = int(math.ceil(L / cols))
+                fig, axes = plt.subplots(rows, cols, figsize=(cols * 2.4, rows * 2.4))
+                # Normalize axes to 2D array
+                if rows == 1 and cols == 1:
+                    axes = np.array([[axes]])
+                elif rows == 1:
+                    axes = np.array([axes])
+                elif cols == 1:
+                    axes = np.array([[ax] for ax in axes])
+                idx = 0
+                for r in range(rows):
+                    for c in range(cols):
+                        ax = axes[r, c]
+                        ax.axis('off')
+                        if idx < L:
+                            m = attns[idx][0].mean(dim=0)
+                            vec = m[0, 1:].detach().float().cpu().numpy()
+                            grid_map = vec.reshape(g2, g2)
+                            grid_map = (grid_map - grid_map.min()) / (grid_map.max() - grid_map.min() + 1e-8)
+                            ax.imshow(grid_map, cmap='inferno')
+                            ax.set_title(f'L{idx+1}', fontsize=8)
+                            idx += 1
+                plt.tight_layout()
+                steps.append({
+                    'step_number': len(steps)+1,
+                    'step_name': 'Attention by Layer',
+                    'finding': 'Per-layer attention from the CLS token to all patches, across every transformer layer.',
+                    'interpretation': 'Each tile shows one layer (L1 at top-left). Early layers attend to simple patterns; deeper layers attend to task-relevant regions. Compare with the combined rollout below.',
+                    'visualization': to_base64_url(fig)
+                })
+        except Exception as e:
+            print(f"Explainer per-layer collage error: {e}")
+
+        # Step 6: Attention rollout across layers
+        try:
+            if attns is None or len(attns) == 0 or attns[0] is None:
+                raise ValueError('attentions not available for rollout')
+            rollout = attention_rollout(attns)
+            if rollout is not None:
+                cls_tokens = rollout[0, 1:].detach().float().cpu().numpy()
+                n_tokens = cls_tokens.shape[0]
+                g2 = int(round(math.sqrt(max(1, n_tokens))))
+                if g2 * g2 == n_tokens:
+                    grid_map = cls_tokens.reshape(g2, g2)
+                    grid_map = (grid_map - grid_map.min()) / (grid_map.max() - grid_map.min() + 1e-8)
+                    heat = _resize_heatmap_to_image(grid_map, image_np.shape)
+                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+                    ax1.imshow(pil_img); ax1.set_title('Original'); ax1.axis('off')
+                    ax2.imshow(pil_img)
+                    ax2.imshow(heat, cmap='magma', alpha=0.45)
+                    ax2.set_title('Attention Rollout (All Layers)')
+                    ax2.axis('off')
+                    steps.append({
+                        'step_number': len(steps)+1,
+                        'step_name': 'Attention Rollout (All Layers)',
+                        'finding': 'Combined “where the model looked” across all layers, not just the last one.',
+                        'interpretation': 'Brighter areas = regions that consistently carried information through the network. This is often more stable than a single-layer heatmap.',
+                        'visualization': to_base64_url(fig)
+                    })
+                else:
+                    steps.append({
+                        'step_number': len(steps)+1,
+                        'step_name': 'Attention Rollout (All Layers)',
+                        'finding': 'Could not map rollout to a square patch grid.',
+                        'interpretation': f'Token count {n_tokens} is not a perfect square; try a ViT model with square patch grid.',
+                        'visualization': None
+                    })
+        except Exception as e:
+            print(f"Explainer rollout error: {e}")
+            steps.append({
+                'step_number': len(steps)+1,
+                'step_name': 'Attention Rollout (All Layers)',
+                'finding': 'No full-layer attention available for this model, so rollout is skipped.',
+                'interpretation': 'Use a standard ViT/DeiT model (e.g., google/vit-base-patch16-224) to get this explanation.',
+                'visualization': None
+            })
+
+        # Step 7: Mid-layer token norms (feature strength)
+        try:
+            if hasattr(outputs, 'hidden_states') and outputs.hidden_states is not None:
+                mid_idx = len(outputs.hidden_states) // 2
+                tokens = outputs.hidden_states[mid_idx][0][1:, :].detach().float().cpu().numpy()
+                norms = np.linalg.norm(tokens, axis=1)
+                if grid * grid == norms.shape[0]:
+                    grid_map = norms.reshape(grid, grid)
+                    grid_map = (grid_map - grid_map.min()) / (grid_map.max() - grid_map.min() + 1e-8)
+                    heat = _resize_heatmap_to_image(grid_map, image_np.shape)
+                    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+                    ax.imshow(heat, cmap='viridis')
+                    ax.axis('off')
+                    ax.set_title('Mid-Layer Token Norms')
+                    steps.append({
+                        'step_number': len(steps)+1,
+                        'step_name': 'Hidden Features (Mid)',
+                        'finding': 'How strong the model’s intermediate features are in each patch (about halfway through the network).',
+                        'interpretation': 'Brighter patches = more “stuff” detected (like edges, textures, shapes). This shows what the network is picking up before the final decision.',
+                        'visualization': to_base64_url(fig)
+                    })
+        except Exception as e:
+            print(f"Explainer mid-layer norms error: {e}")
+
+
+    except Exception as e:
+        print(f"ViT explanation error: {e}")
+        steps.append({
+            'step_number': len(steps)+1 if steps else 1,
+            'step_name': 'Explainer Error',
+            'finding': 'Failed to compute ViT explanations.',
             'interpretation': str(e),
             'visualization': None
         })
@@ -394,7 +862,7 @@ def detect():
         # Model internals (HF) + final prediction
         analysis_data = {}
         print("→ Model Internals (HF)...")
-        analysis_steps = analyze_hf_internals(image_np)
+        # analysis_steps = analyze_hf_internals(image_np)
         print("→ Final Prediction (HF pipeline)...")
         result, confidence = perform_final_prediction(image_np, analysis_data)
         
@@ -406,7 +874,7 @@ def detect():
         return jsonify({
             'prediction': result,
             'confidence': float(confidence),
-            'analysis_steps': analysis_steps,
+            'analysis_steps': [],
             'model_used': hf_model_id or 'huggingface:model',
             'raw_predictions': analysis_data.get('raw_predictions', [])
         })
@@ -460,6 +928,58 @@ def model_info():
             'loaded': hf_pipe is not None
         })
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/explain', methods=['POST'])
+def explain():
+    """Return ViT-based, step-by-step visual explanations independent of detector."""
+    try:
+        if 'image' not in request.files:
+            return jsonify({'error': 'No image provided'}), 400
+        file = request.files['image']
+        image = Image.open(io.BytesIO(file.read())).convert('RGB')
+        image_np = np.array(image)
+        steps = explain_with_vit(image_np)
+        return jsonify({
+            'analysis_steps': steps,
+            'explainer_model': explainer_model_id
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/explainer/select', methods=['POST'])
+def select_explainer():
+    """Switch explainer ViT model at runtime. Body: {"model_id": "<repo/model>"}"""
+    try:
+        data = request.get_json(silent=True) or {}
+        model_id = data.get('model_id')
+        if not model_id:
+            return jsonify({'error': 'model_id is required'}), 400
+        load_explainer_model(model_id)
+        return jsonify({'ok': True, 'model_id': explainer_model_id})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/explain/sensitivity', methods=['POST'])
+def explain_sensitivity():
+    """Compute detector-based patch sensitivity separately so UI can load it async."""
+    try:
+        if 'image' not in request.files:
+            return jsonify({'error': 'No image provided'}), 400
+        file = request.files['image']
+        image = Image.open(io.BytesIO(file.read())).convert('RGB')
+        image_np = np.array(image)
+        vis_url, finding_text = compute_patch_sensitivity(image_np, grid=10)
+        step = {
+            'step_number': 1,
+            'step_name': 'Patch Sensitivity',
+            'finding': finding_text if vis_url is not None else 'Detector sensitivity unavailable',
+            'interpretation': 'Brighter areas = blurring this region lowers the detector\'s confidence the most. This verifies the detector\'s focus on these regions.',
+            'visualization': vis_url
+        }
+        return jsonify({'step': step})
+    except Exception as e:
+        print(f"Patch sensitivity endpoint error: {e}")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
