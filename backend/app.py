@@ -98,6 +98,7 @@ def load_models():
 
         # Load default HF model (can be changed via env HF_MODEL_ID or API)
         # default_hf_model = os.environ.get('HF_MODEL_ID', 'Organika/sdxl-detector')
+        # default_hf_model = os.environ.get('HF_MODEL_ID', 'NYUAD-ComNets/NYUAD_AI-generated_images_detector')
         default_hf_model = os.environ.get('HF_MODEL_ID', 'Smogy/SMOGY-Ai-images-detector')
         # default_hf_model = os.environ.get('HF_MODEL_ID', 'dima806/deepfake_vs_real_image_detection') # this is the most accurate one yet with some wrong results
         # default_hf_model = os.environ.get('HF_MODEL_ID', 'Yin2610/autotrain2')

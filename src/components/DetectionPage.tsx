@@ -141,7 +141,7 @@ const DetectionPage: React.FC = () => {
   return (
     <Box>
       <Typography variant="h3" component="h1" gutterBottom align="center">
-        Deepfake Detection
+        AI Detection
       </Typography>
       <Typography variant="body1" align="center" color="text.secondary" sx={{ mb: 4 }}>
         Upload an image to analyze it for potential deepfake or manipulation artifacts
@@ -202,7 +202,7 @@ const DetectionPage: React.FC = () => {
         <Grid item xs={12} md={6}>
           <Paper sx={{ p: 3, minHeight: '400px' }}>
             <Typography variant="h5" gutterBottom>
-              Analysis Results
+              Results
             </Typography>
 
             {isProcessing && (
@@ -303,7 +303,7 @@ const DetectionPage: React.FC = () => {
                   </Paper>
                 )}
 
-                <Typography variant="h6" gutterBottom>
+                {/* <Typography variant="h6" gutterBottom>
                   Analysis Steps
                 </Typography>
                 <Box className="detection-steps">
@@ -409,7 +409,7 @@ const DetectionPage: React.FC = () => {
                     </Accordion>
                     );
                   })}
-                </Box>
+                </Box> */}
               </Box>
             )}
 

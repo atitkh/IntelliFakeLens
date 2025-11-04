@@ -13,22 +13,6 @@ const Navigation: React.FC = () => {
       >
         Home
       </Button>
-      <Button 
-        color="inherit" 
-        component={RouterLink} 
-        to="/detect"
-        sx={{ textTransform: 'none' }}
-      >
-        Detect
-      </Button>
-      <Button 
-        color="inherit" 
-        component={RouterLink} 
-        to="/about"
-        sx={{ textTransform: 'none' }}
-      >
-        About
-      </Button>
     </Box>
   );
 };

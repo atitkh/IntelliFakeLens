@@ -2,9 +2,7 @@ import React from 'react';
 import { Routes, Route } from 'react-router-dom';
 import { Container, AppBar, Toolbar, Typography, Box } from '@mui/material';
 import SecurityIcon from '@mui/icons-material/Security';
-import HomePage from './components/HomePage';
 import DetectionPage from './components/DetectionPage';
-import AboutPage from './components/AboutPage';
 import Navigation from './components/Navigation';
 
 const App: React.FC = () => {
@@ -22,9 +20,8 @@ const App: React.FC = () => {
       
       <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
         <Routes>
-          <Route path="/" element={<HomePage />} />
+          <Route path="/" element={<DetectionPage />} />
           <Route path="/detect" element={<DetectionPage />} />
-          <Route path="/about" element={<AboutPage />} />
         </Routes>
       </Container>
     </Box>
