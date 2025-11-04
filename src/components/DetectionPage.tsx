@@ -303,7 +303,7 @@ const DetectionPage: React.FC = () => {
                   sx={{ mb: 3 }}
                 >
                   <Typography variant="h6">
-                    Prediction: {detectionResult.prediction}
+                    {detectionResult.prediction.charAt(0).toUpperCase() + detectionResult.prediction.slice(1)}
                   </Typography>
                   <Typography variant="body2">
                     Confidence: {(detectionResult.confidence * 100).toFixed(1)}%
